@@ -1,0 +1,171 @@
+name: PureDNS Brute Force Scanner (Optimized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_domain:
+        description: 'Target domain to brute force (e.g. example.com)'
+        required: true
+        default: ''
+      wordlist_url:
+        description: 'URL of the subdomain wordlist (raw text file)'
+        required: false
+        default: 'https://github.com/shankabolo/subs/releases/download/sub/part_03.txt'
+      resolver_url:
+        description: 'URL of the resolver list (raw text file)'
+        required: false
+        default: 'https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt'
+
+jobs:
+  bruteforce:
+    name: Brute Force (Chunk ${{ matrix.chunk }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chunk: 0
+            rate: 330
+          - chunk: 1
+            rate: 335
+          - chunk: 2
+            rate: 335
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.21.0'
+
+      - name: Cache Go Modules and Binaries
+        uses: actions/cache@v4
+        id: cache-bin
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/go/bin
+            /usr/local/bin/massdns
+            /usr/local/bin/puredns
+          key: ${{ runner.os }}-puredns-v2
+
+      - name: Install MassDNS & PureDNS (if cache miss)
+        run: |
+          if [ ! -f /usr/local/bin/massdns ] || [ ! -f /usr/local/bin/puredns ]; then
+            echo "Binaries not found in cache – installing..."
+            sudo apt-get update && sudo apt-get install -y git build-essential libpcap-dev curl
+
+            git clone https://github.com/blechschmidt/massdns.git
+            cd massdns
+            make -j$(nproc)
+            sudo cp bin/massdns /usr/local/bin/
+            cd .. && rm -rf massdns
+
+            go install github.com/d3mondev/puredns/v2@latest
+            sudo cp $(go env GOPATH)/bin/puredns /usr/local/bin/
+          else
+            echo "MassDNS and PureDNS are already cached."
+          fi
+
+      - name: Download Resolver List
+        run: |
+          curl -s -L "${{ inputs.resolver_url }}" -o resolvers.txt
+          echo "Total resolvers: $(wc -l < resolvers.txt)"
+
+      - name: Download Wordlist
+        run: |
+          curl -s -L "${{ inputs.wordlist_url }}" -o subdomains.txt
+          echo "Wordlist size: $(wc -l < subdomains.txt) lines"
+
+      - name: Split Wordlist into Chunks
+        run: |
+          split -n l/3 -d -a 1 subdomains.txt chunk_
+          for i in 0 1 2; do
+            mv "chunk_$i" "chunk_$i.txt"
+          done
+          echo "Chunk sizes:"
+          wc -l chunk_*.txt
+
+      - name: Execute PureDNS Brute Force
+        env:
+          TARGET: ${{ inputs.target_domain }}
+          RATE: ${{ matrix.rate }}
+          CHUNK: ${{ matrix.chunk }}
+        run: |
+          WORDLIST="chunk_${CHUNK}.txt"
+
+          if [ -z "$TARGET" ]; then
+            echo "❌ Error: TARGET domain is empty. Please provide a domain."
+            exit 1
+          fi
+
+          if [ ! -s "$WORDLIST" ]; then
+            echo "❌ Error: Wordlist chunk '$WORDLIST' is empty or missing."
+            exit 1
+          fi
+
+          echo "🔍 Target: $TARGET"
+          echo "⚡ Rate limit: $RATE queries/sec"
+          echo "📄 Wordlist chunk: $WORDLIST ($(wc -l < $WORDLIST) entries)"
+          echo "--- First 5 subdomains from this chunk ---"
+          head -n 5 "$WORDLIST"
+
+          cat "$WORDLIST" | puredns bruteforce "$TARGET" \
+            -r resolvers.txt \
+            --rate-limit "$RATE" \
+            --wildcard-tests 10 \
+            -w "found_subs_${CHUNK}.txt" \
+            --debug
+
+      - name: Process Results
+        env:
+          CHUNK: ${{ matrix.chunk }}
+        run: |
+          if [ -s "found_subs_${CHUNK}.txt" ]; then
+            sort -u "found_subs_${CHUNK}.txt" > "live_subdomains_${CHUNK}.txt"
+            echo "✅ Discovered $(wc -l < live_subdomains_${CHUNK}.txt) unique subdomains in chunk ${CHUNK}"
+            echo "--- Sample results ---"
+            head -n 10 "live_subdomains_${CHUNK}.txt"
+          else
+            touch "live_subdomains_${CHUNK}.txt"
+            echo "ℹ️ No valid subdomains found in chunk ${CHUNK}."
+          fi
+
+      - name: Upload Discovered Subdomains (Chunk ${{ matrix.chunk }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: discovered-subs-chunk-${{ matrix.chunk }}
+          path: live_subdomains_${{ matrix.chunk }}.txt
+
+  merge-results:
+    name: Merge All Results
+    needs: bruteforce
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./all_results
+
+      - name: Merge and Deduplicate
+        run: |
+          echo "=== Merging all discovered subdomains ==="
+          find ./all_results -name "live_subdomains_*.txt" -exec cat {} \; | sort -u > all_discovered_subdomains.txt
+          TOTAL=$(wc -l < all_discovered_subdomains.txt)
+          echo "✅ Total unique subdomains found: $TOTAL"
+
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "=== Full list ==="
+            cat all_discovered_subdomains.txt
+          else
+            echo "No subdomains were discovered."
+          fi
+
+      - name: Upload Merged Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-discovered-subdomains-merged
+          path: all_discovered_subdomains.txt
