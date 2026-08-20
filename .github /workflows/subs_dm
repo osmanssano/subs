@@ -42,6 +42,9 @@ jobs:
 
       # ----------------------------------------------------------------------
       # Caching – saves compiled binaries and Go modules between runs
+      # Fix: /usr/local/bin/puredns was missing from the cached paths. Since
+      # the install check below is an OR condition, a missing puredns path
+      # made the cache useless every single run (massdns got rebuilt too).
       # ----------------------------------------------------------------------
       - name: Cache Go Modules and Binaries
         uses: actions/cache@v4
@@ -51,7 +54,8 @@ jobs:
             ~/go/pkg/mod
             ~/go/bin
             /usr/local/bin/massdns
-          key: ${{ runner.os }}-puredns-v1
+            /usr/local/bin/puredns
+          key: ${{ runner.os }}-puredns-v2
 
       # ----------------------------------------------------------------------
       # Install MassDNS & PureDNS if not already cached
@@ -143,8 +147,14 @@ jobs:
 
       # ----------------------------------------------------------------------
       # Process and sort results
+      # Fix: this step referenced $CHUNK without its own `env:` block. Step
+      # env vars don't carry over between steps, so $CHUNK was empty here,
+      # producing "live_subdomains_.txt" instead of "live_subdomains_0.txt"
+      # etc., which made the Upload step below fail (file not found).
       # ----------------------------------------------------------------------
       - name: Process Results
+        env:
+          CHUNK: ${{ matrix.chunk }}
         run: |
           if [ -s "found_subs_${CHUNK}.txt" ]; then
             sort -u "found_subs_${CHUNK}.txt" > "live_subdomains_${CHUNK}.txt"
