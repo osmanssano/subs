@@ -10,7 +10,7 @@ on:
       wordlist_url:
         description: 'URL of the subdomain wordlist (raw text file)'
         required: false
-        default: 'https://github.com/osmanssano/subs/releases/download/sub/wordlist.txt'
+        default: 'https://github.com/shankabolo/subs/releases/download/sub/part_03.txt'
       resolver_url:
         description: 'URL of the resolver list (raw text file)'
         required: false
@@ -40,12 +40,6 @@ jobs:
         with:
           go-version: '>=1.21.0'
 
-      # ----------------------------------------------------------------------
-      # Caching – saves compiled binaries and Go modules between runs
-      # Fix: /usr/local/bin/puredns was missing from the cached paths. Since
-      # the install check below is an OR condition, a missing puredns path
-      # made the cache useless every single run (massdns got rebuilt too).
-      # ----------------------------------------------------------------------
       - name: Cache Go Modules and Binaries
         uses: actions/cache@v4
         id: cache-bin
@@ -57,48 +51,34 @@ jobs:
             /usr/local/bin/puredns
           key: ${{ runner.os }}-puredns-v2
 
-      # ----------------------------------------------------------------------
-      # Install MassDNS & PureDNS if not already cached
-      # ----------------------------------------------------------------------
       - name: Install MassDNS & PureDNS (if cache miss)
         run: |
           if [ ! -f /usr/local/bin/massdns ] || [ ! -f /usr/local/bin/puredns ]; then
             echo "Binaries not found in cache – installing..."
             sudo apt-get update && sudo apt-get install -y git build-essential libpcap-dev curl
 
-            # Build MassDNS
             git clone https://github.com/blechschmidt/massdns.git
             cd massdns
             make -j$(nproc)
             sudo cp bin/massdns /usr/local/bin/
             cd .. && rm -rf massdns
 
-            # Install PureDNS
             go install github.com/d3mondev/puredns/v2@latest
             sudo cp $(go env GOPATH)/bin/puredns /usr/local/bin/
           else
             echo "MassDNS and PureDNS are already cached."
           fi
 
-      # ----------------------------------------------------------------------
-      # Download resolvers (fresh list)
-      # ----------------------------------------------------------------------
       - name: Download Resolver List
         run: |
           curl -s -L "${{ inputs.resolver_url }}" -o resolvers.txt
           echo "Total resolvers: $(wc -l < resolvers.txt)"
 
-      # ----------------------------------------------------------------------
-      # Download wordlist from the provided URL
-      # ----------------------------------------------------------------------
       - name: Download Wordlist
         run: |
           curl -s -L "${{ inputs.wordlist_url }}" -o subdomains.txt
           echo "Wordlist size: $(wc -l < subdomains.txt) lines"
 
-      # ----------------------------------------------------------------------
-      # Split wordlist into 3 equal parts for parallel processing
-      # ----------------------------------------------------------------------
       - name: Split Wordlist into Chunks
         run: |
           split -n l/3 -d -a 1 subdomains.txt chunk_
@@ -108,9 +88,6 @@ jobs:
           echo "Chunk sizes:"
           wc -l chunk_*.txt
 
-      # ----------------------------------------------------------------------
-      # Run PureDNS brute force on the assigned chunk
-      # ----------------------------------------------------------------------
       - name: Execute PureDNS Brute Force
         env:
           TARGET: ${{ inputs.target_domain }}
@@ -119,7 +96,6 @@ jobs:
         run: |
           WORDLIST="chunk_${CHUNK}.txt"
 
-          # Input validation
           if [ -z "$TARGET" ]; then
             echo "❌ Error: TARGET domain is empty. Please provide a domain."
             exit 1
@@ -136,22 +112,13 @@ jobs:
           echo "--- First 5 subdomains from this chunk ---"
           head -n 5 "$WORDLIST"
 
-          # Run puredns with wildcard detection and stdin piping
           cat "$WORDLIST" | puredns bruteforce "$TARGET" \
             -r resolvers.txt \
             --rate-limit "$RATE" \
-            --wildcard-threshold 5 \
             --wildcard-tests 10 \
             -w "found_subs_${CHUNK}.txt" \
             --debug
 
-      # ----------------------------------------------------------------------
-      # Process and sort results
-      # Fix: this step referenced $CHUNK without its own `env:` block. Step
-      # env vars don't carry over between steps, so $CHUNK was empty here,
-      # producing "live_subdomains_.txt" instead of "live_subdomains_0.txt"
-      # etc., which made the Upload step below fail (file not found).
-      # ----------------------------------------------------------------------
       - name: Process Results
         env:
           CHUNK: ${{ matrix.chunk }}
@@ -166,23 +133,17 @@ jobs:
             echo "ℹ️ No valid subdomains found in chunk ${CHUNK}."
           fi
 
-      # ----------------------------------------------------------------------
-      # Upload chunk-specific results as artifact
-      # ----------------------------------------------------------------------
       - name: Upload Discovered Subdomains (Chunk ${{ matrix.chunk }})
         uses: actions/upload-artifact@v4
         with:
           name: discovered-subs-chunk-${{ matrix.chunk }}
           path: live_subdomains_${{ matrix.chunk }}.txt
 
-  # --------------------------------------------------------------------------
-  # Merge all chunk results into a single file
-  # --------------------------------------------------------------------------
   merge-results:
     name: Merge All Results
     needs: bruteforce
     runs-on: ubuntu-latest
-    if: always()  # run even if some chunks fail
+    if: always()
     steps:
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
