@@ -10,7 +10,7 @@ on:
       wordlist_url:
         description: 'URL of the subdomain wordlist (raw text file)'
         required: false
-        default: 'https://github.com/shankabolo/subs/releases/download/sub/part_03.txt'
+        default: 'https://github.com/osmanssano/subs/releases/download/sub/part_02.txt'
       resolver_url:
         description: 'URL of the resolver list (raw text file)'
         required: false
