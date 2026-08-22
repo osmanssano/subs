@@ -1,0 +1,168 @@
+name: PureDNS Resolver (Optimized for Alterx Outputs)
+
+on:
+  workflow_dispatch:
+    inputs:
+      wordlist_url:
+        description: 'رابط ملف الدومينات الناتج من Alterx (يدعم .txt, .zip, .tar.gz)'
+        required: true
+        default: ''
+      resolvers_url:
+        description: 'رابط قائمة Resolvers (نص عادي)'
+        required: false
+        default: 'https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt'
+      rate_limit:
+        description: 'عدد الاستعلامات في الثانية (Rate Limit)'
+        required: false
+        default: '1000'
+
+jobs:
+  resolve:
+    name: DNS Resolution
+    runs-on: ubuntu-latest
+    
+    env:
+      RESOLVERS_FILE: resolvers.txt
+      OUTPUT_FILE: resolved_subdomains.txt
+      CACHE_FILE: puredns_cache.json
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ------------------------- التجهيزات الأساسية -------------------------
+      - name: Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.21.0'
+
+      - name: Cache PureDNS Binary
+        uses: actions/cache@v4
+        id: cache-puredns
+        with:
+          path: |
+            ~/go/bin/puredns
+            /usr/local/bin/puredns
+          key: ${{ runner.os }}-puredns-v2
+
+      - name: Install PureDNS
+        if: steps.cache-puredns.outputs.cache-hit != 'true'
+        run: |
+          go install github.com/d3mondev/puredns/v2@latest
+          sudo cp $(go env GOPATH)/bin/puredns /usr/local/bin/
+
+      # ------------------------- تحميل الـ Resolvers -------------------------
+      - name: Cache Resolvers List
+        uses: actions/cache@v4
+        id: cache-resolvers
+        with:
+          path: ${{ env.RESOLVERS_FILE }}
+          key: ${{ runner.os }}-resolvers-${{ hashFiles('resolvers.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-resolvers-
+
+      - name: Download Resolvers
+        if: steps.cache-resolvers.outputs.cache-hit != 'true'
+        run: |
+          curl -s -L "${{ inputs.resolvers_url }}" -o ${{ env.RESOLVERS_FILE }}
+          echo "✅ تم تحميل عدد $(wc -l < ${{ env.RESOLVERS_FILE }}) من الـ Resolvers"
+
+      # ------------------------- تحميل وفك ضغط الـ Wordlist -------------------------
+      - name: Download and Extract Wordlist
+        run: |
+          WORDLIST_URL="${{ inputs.wordlist_url }}"
+          FILENAME=$(basename "$WORDLIST_URL")
+          
+          echo "📥 جاري تحميل الملف: $FILENAME"
+          curl -s -L "$WORDLIST_URL" -o "$FILENAME"
+
+          # فك الضغط حسب نوع الملف
+          EXTRACT_DIR="wordlist_extracted"
+          mkdir -p "$EXTRACT_DIR"
+
+          case "$FILENAME" in
+            *.zip)
+              sudo apt-get install -y unzip > /dev/null
+              unzip -o "$FILENAME" -d "$EXTRACT_DIR"
+              ;;
+            *.tar.gz|*.tgz)
+              tar -xzf "$FILENAME" -C "$EXTRACT_DIR"
+              ;;
+            *.txt)
+              mv "$FILENAME" "$EXTRACT_DIR/"
+              ;;
+            *)
+              echo "❌ خطأ: الصيغة غير مدعومة. استخدم .txt, .zip, أو .tar.gz"
+              exit 1
+              ;;
+          esac
+
+          # البحث عن أول ملف .txt داخل المجلد المستخرج
+          WORDLIST_PATH=$(find "$EXTRACT_DIR" -name "*.txt" -type f | head -n 1)
+          
+          if [ -z "$WORDLIST_PATH" ]; then
+            echo "❌ خطأ: لم يتم العثور على ملف .txt داخل المحتوى المستخرج."
+            exit 1
+          fi
+
+          echo "📄 تم تحديد ملف الكلمات: $WORDLIST_PATH"
+          echo "📊 عدد السطور: $(wc -l < "$WORDLIST_PATH")"
+          echo "WORDLIST_PATH=$WORDLIST_PATH" >> $GITHUB_ENV
+
+      # ------------------------- الـ Cache الخاص بـ PureDNS -------------------------
+      - name: Cache PureDNS Resolve Results
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CACHE_FILE }}
+          key: ${{ runner.os }}-puredns-cache-${{ hashFiles(env.WORDLIST_PATH) }}
+          restore-keys: |
+            ${{ runner.os }}-puredns-cache-
+
+      # ------------------------- التنفيذ (الأمر المطلوب) -------------------------
+      - name: Run PureDNS Resolve
+        run: |
+          echo "🚀 بدء تنفيذ الأمر: puredns resolve"
+          echo "⚡ معدل الاستعلامات: ${{ inputs.rate_limit }} استعلام/ثانية"
+          echo "📂 ملف الإدخال: $WORDLIST_PATH"
+          echo "📂 ملف الإخراج: ${{ env.OUTPUT_FILE }}"
+
+          # تنفيذ الأمر الأساسي
+          puredns resolve "$WORDLIST_PATH" \
+            -r "${{ env.RESOLVERS_FILE }}" \
+            -w "${{ env.OUTPUT_FILE }}" \
+            --rate-limit "${{ inputs.rate_limit }}" \
+            --cache-file "${{ env.CACHE_FILE }}" \
+            --wildcard-tests 10 \
+            --debug
+
+      # ------------------------- معالجة النتائج -------------------------
+      - name: Process and Deduplicate Results
+        run: |
+          if [ -s "${{ env.OUTPUT_FILE }}" ]; then
+            # فرز وإزالة التكرارات
+            sort -u "${{ env.OUTPUT_FILE }}" > temp_unique.txt
+            mv temp_unique.txt "${{ env.OUTPUT_FILE }}"
+            
+            TOTAL=$(wc -l < "${{ env.OUTPUT_FILE }}")
+            echo "✅ ✅ ✅ تم العثور على $TOTAL دومين فرعي صحيح ونشط!"
+            echo "--- عينة من النتائج (أول 10 سطور) ---"
+            head -n 10 "${{ env.OUTPUT_FILE }}"
+          else
+            echo "ℹ️ لم يتم العثور على أي دومينات صحيحة في الملف المدخل."
+          fi
+
+      # ------------------------- رفع المخرجات -------------------------
+      - name: Upload Discovered Subdomains
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-subdomains
+          path: ${{ env.OUTPUT_FILE }}
+          if-no-files-found: warn
+
+      - name: Upload Cache File (اختياري للتصحيح)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: puredns-cache-file
+          path: ${{ env.CACHE_FILE }}
+          retention-days: 1
